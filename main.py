@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import shutil
 import streamlit as st
 import yt_dlp
 
@@ -7,6 +7,8 @@ import yt_dlp
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+st.write("yt-dlp:", yt_dlp.version.__version__)
+st.write("deno:", shutil.which("deno"))
 
 def download_media(url: str, media_format: str, progress_bar, status_text):
     def progress_hook(data):
