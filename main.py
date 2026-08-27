@@ -13,7 +13,7 @@ import yt_dlp
 # ============================================================
 
 DOWNLOAD_DIR = Path("downloads")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 NODE_VERSION = "22.23.2"
 
@@ -26,22 +26,19 @@ NODE_BIN = NODE_DIR / "bin" / "node"
 # NODE.JS SETUP
 # ============================================================
 
-def ensure_node():
+def ensure_node() -> Path:
     """
-    Ensure Node.js is available.
-
-    Priority:
-    1. Use system Node.js if available.
-    2. Otherwise download the official Node.js 22 binary.
+    Find an existing Node.js installation or install the
+    official Node.js binary locally.
     """
 
-    # Check if Node is already installed
+    # 1. Check system Node.js
     system_node = shutil.which("node")
 
     if system_node:
         return Path(system_node)
 
-    # Check if we've already downloaded Node
+    # 2. Check cached local installation
     if NODE_BIN.exists():
         return NODE_BIN
 
@@ -54,8 +51,9 @@ def ensure_node():
         f"https://nodejs.org/dist/v{NODE_VERSION}/{archive_name}"
     )
 
-    # Download Node.js
     with st.spinner("Setting up Node.js..."):
+
+        # Download
         if not archive_path.exists():
             urllib.request.urlretrieve(
                 download_url,
@@ -74,7 +72,7 @@ def ensure_node():
             / f"node-v{NODE_VERSION}-linux-x64"
         )
 
-        # Rename extracted directory to our predictable path
+        # Rename to predictable directory
         if extracted_dir.exists() and not NODE_DIR.exists():
             extracted_dir.rename(NODE_DIR)
 
@@ -89,13 +87,23 @@ def ensure_node():
     return NODE_BIN
 
 
-# Initialize Node before yt-dlp is used
-NODE_PATH = ensure_node()
+def setup_node():
+    """
+    Configure Node.js for yt-dlp.
+    """
 
-# Add Node to PATH
-os.environ["PATH"] = (
-    f"{NODE_PATH.parent}:{os.environ.get('PATH', '')}"
-)
+    node_path = ensure_node()
+
+    node_dir = str(node_path.parent)
+
+    current_path = os.environ.get("PATH", "")
+
+    if node_dir not in current_path.split(os.pathsep):
+        os.environ["PATH"] = (
+            f"{node_dir}{os.pathsep}{current_path}"
+        )
+
+    return node_path
 
 
 # ============================================================
@@ -118,7 +126,7 @@ def download_media(
 
     def progress_hook(data):
 
-        if data["status"] == "downloading":
+        if data.get("status") == "downloading":
 
             total = (
                 data.get("total_bytes")
@@ -141,11 +149,10 @@ def download_media(
 
                 percentage = progress * 100
 
-                # Download speed
+                # Speed
                 speed = data.get("speed")
 
                 if speed:
-
                     speed_mb = (
                         speed / (1024 * 1024)
                     )
@@ -153,11 +160,10 @@ def download_media(
                     speed_text = (
                         f"{speed_mb:.2f} MB/s"
                     )
-
                 else:
                     speed_text = "Calculating..."
 
-                # Downloaded / total size
+                # Size
                 downloaded_mb = (
                     downloaded / (1024 * 1024)
                 )
@@ -173,7 +179,7 @@ def download_media(
                     f"{speed_text}"
                 )
 
-        elif data["status"] == "finished":
+        elif data.get("status") == "finished":
 
             progress_bar.progress(1.0)
 
@@ -181,37 +187,38 @@ def download_media(
                 "Processing file..."
             )
 
-
     # --------------------------------------------------------
-    # Common yt-dlp options
+    # yt-dlp options
     # --------------------------------------------------------
 
     common_opts = {
-        # IMPORTANT:
-        # Use Node.js for YouTube JavaScript challenges
+
+        # YouTube JS challenge solving
         "js_runtimes": {
             "node": {},
         },
 
+        # Output
         "outtmpl": str(
             DOWNLOAD_DIR
             / "%(title).80B.%(ext)s"
         ),
 
+        # Never download playlists
         "noplaylist": True,
 
+        # Progress
         "progress_hooks": [
             progress_hook
         ],
 
+        # Reduce console noise
         "quiet": True,
-
         "no_warnings": True,
     }
 
-
     # --------------------------------------------------------
-    # MUSIC / MP3
+    # MP3
     # --------------------------------------------------------
 
     if media_format == "MUSIC":
@@ -230,9 +237,8 @@ def download_media(
             ],
         }
 
-
     # --------------------------------------------------------
-    # VIDEO / MP4
+    # MP4
     # --------------------------------------------------------
 
     else:
@@ -246,7 +252,6 @@ def download_media(
 
             "merge_output_format": "mp4",
         }
-
 
     # --------------------------------------------------------
     # Download
@@ -264,26 +269,19 @@ def download_media(
         )
 
     # --------------------------------------------------------
-    # Determine final filepath
+    # Final file path
     # --------------------------------------------------------
 
     if media_format == "MUSIC":
-
-        filepath = original_filepath.with_suffix(
-            ".mp3"
-        )
-
+        filepath = original_filepath.with_suffix(".mp3")
     else:
-
-        filepath = original_filepath.with_suffix(
-            ".mp4"
-        )
+        filepath = original_filepath.with_suffix(".mp4")
 
     return filepath
 
 
 # ============================================================
-# STREAMLIT UI
+# STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -292,6 +290,10 @@ st.set_page_config(
     layout="centered",
 )
 
+
+# ============================================================
+# UI
+# ============================================================
 
 st.title("YouTube Downloader")
 
@@ -306,9 +308,7 @@ st.caption(
 
 url = st.text_input(
     "YouTube URL",
-    placeholder=(
-        "Paste a YouTube link here..."
-    ),
+    placeholder="Paste a YouTube link here...",
 )
 
 
@@ -324,7 +324,7 @@ format_choice = st.radio(
 
 
 # ------------------------------------------------------------
-# Download button
+# Download
 # ------------------------------------------------------------
 
 if st.button(
@@ -337,15 +337,17 @@ if st.button(
     # Validate URL
     # --------------------------------------------------------
 
-    if not url.strip():
+    clean_url = url.strip()
+
+    if not clean_url:
 
         st.error(
             "Please enter a YouTube URL."
         )
 
     elif (
-        "youtube.com/" not in url
-        and "youtu.be/" not in url
+        "youtube.com/" not in clean_url
+        and "youtu.be/" not in clean_url
     ):
 
         st.error(
@@ -354,16 +356,23 @@ if st.button(
 
     else:
 
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
         try:
 
             # ------------------------------------------------
-            # Progress UI
+            # Node setup
             # ------------------------------------------------
 
-            progress_bar = st.progress(0)
+            with st.spinner(
+                "Preparing downloader..."
+            ):
+                node_path = setup_node()
 
-            status_text = st.empty()
-
+            status_text.write(
+                f"Using Node.js: `{node_path}`"
+            )
 
             # ------------------------------------------------
             # Download
@@ -374,24 +383,28 @@ if st.button(
             ):
 
                 filepath = download_media(
-                    url.strip(),
+                    clean_url,
                     format_choice,
                     progress_bar,
                     status_text,
                 )
 
-
             # ------------------------------------------------
-            # Check output
+            # Validate output
             # ------------------------------------------------
 
             if not filepath.exists():
 
                 raise FileNotFoundError(
-                    f"Downloaded file not found: "
+                    "Downloaded file was not found: "
                     f"{filepath}"
                 )
 
+            if filepath.stat().st_size == 0:
+
+                raise RuntimeError(
+                    "Downloaded file is empty."
+                )
 
             # ------------------------------------------------
             # Success
@@ -403,35 +416,25 @@ if st.button(
                 "Download ready!"
             )
 
-
             # ------------------------------------------------
             # Browser download
             # ------------------------------------------------
 
-            with open(
-                filepath,
-                "rb",
-            ) as file:
+            with open(filepath, "rb") as file:
 
                 st.download_button(
                     label=(
-                        f"⬇️ Save "
-                        f"{format_choice}"
+                        f"⬇️ Save {format_choice}"
                     ),
-
                     data=file,
-
                     file_name=filepath.name,
-
                     mime=(
                         "audio/mpeg"
                         if format_choice == "MUSIC"
                         else "video/mp4"
                     ),
-
                     use_container_width=True,
                 )
-
 
         except Exception as e:
 
