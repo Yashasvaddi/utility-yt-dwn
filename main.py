@@ -1,7 +1,10 @@
 from pathlib import Path
 import os
 import shutil
+import socket
+import subprocess
 import tarfile
+import time
 import urllib.request
 
 import streamlit as st
@@ -21,15 +24,26 @@ NODE_BASE_DIR = Path.home() / ".local"
 NODE_DIR = NODE_BASE_DIR / f"node-v{NODE_VERSION}"
 NODE_BIN = NODE_DIR / "bin" / "node"
 
-# Player clients to try, in order. Some clients need PO Tokens
-# far less often than the default "web" client, so falling back
-# through this list resolves a lot of 403s that aren't caused
-# by an outright IP block.
+# bgutil PO Token provider. The version here MUST match the
+# `bgutil-ytdlp-pot-provider` pin in requirements.txt so the
+# plugin and the server speak the same protocol.
+BGUTIL_VERSION = "1.3.1"
+BGUTIL_DIR = Path.home() / "bgutil-ytdlp-pot-provider"
+BGUTIL_SERVER_DIR = BGUTIL_DIR / "server"
+BGUTIL_BUILD_MAIN = BGUTIL_SERVER_DIR / "build" / "main.js"
+POT_HOST = "127.0.0.1"
+POT_PORT = 4416  # bgutil's default; the pip plugin auto-discovers this.
+
+# Player clients to try, in order. With the PO Token server
+# running, the web-family clients (web_safari / web / mweb) get
+# their GVS tokens automatically and yield the best formats, so
+# they go first. `tv` streams HLS that needs no GVS token, so it
+# stays as a last-ditch fallback.
 PLAYER_CLIENT_FALLBACKS = [
-    ["tv", "web_safari"],
-    ["android", "web"],
-    ["ios"],
+    ["web_safari", "web"],
     ["mweb"],
+    ["android"],
+    ["tv"],
 ]
 
 
@@ -93,6 +107,115 @@ def setup_node():
 
 
 # ============================================================
+# PO TOKEN PROVIDER (bgutil) SETUP
+# ============================================================
+#
+# YouTube's newer clients require a GVS PO Token for their media
+# (DASH) URLs. Without it, format listing succeeds but the actual
+# byte download 403s. Tokens are now bound to the video id, so a
+# provider that mints them on demand is the only workable path.
+#
+# We build bgutil's HTTP server once (cached), start it on port
+# 4416 (cached), and the pip-installed `bgutil-ytdlp-pot-provider`
+# plugin auto-discovers it there — no extractor-args needed.
+
+def _port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        return sock.connect_ex((host, port)) == 0
+
+
+@st.cache_resource(show_spinner="Building PO Token provider (one-time, ~1-2 min)...")
+def ensure_bgutil_built(node_bin_dir: str) -> str:
+    """
+    Clone + transpile the bgutil POT server. Cached, so it only
+    runs once per app boot. Returns the path to build/main.js.
+    """
+
+    npm = str(Path(node_bin_dir) / "npm")
+    npx = str(Path(node_bin_dir) / "npx")
+
+    if not BGUTIL_BUILD_MAIN.exists():
+
+        if not BGUTIL_DIR.exists():
+            subprocess.run(
+                [
+                    "git", "clone", "--single-branch",
+                    "--branch", BGUTIL_VERSION,
+                    "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git",
+                    str(BGUTIL_DIR),
+                ],
+                check=True, capture_output=True, text=True,
+            )
+
+        # npm ci installs devDependencies (incl. typescript) which
+        # npx tsc then uses to transpile the server into build/.
+        subprocess.run(
+            [npm, "ci"],
+            cwd=str(BGUTIL_SERVER_DIR),
+            check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            [npx, "tsc"],
+            cwd=str(BGUTIL_SERVER_DIR),
+            check=True, capture_output=True, text=True,
+        )
+
+    if not BGUTIL_BUILD_MAIN.exists():
+        raise RuntimeError("bgutil build did not produce server/build/main.js")
+
+    return str(BGUTIL_BUILD_MAIN)
+
+
+@st.cache_resource(show_spinner="Starting PO Token provider...")
+def start_pot_server(node_bin: str, build_main: str) -> str:
+    """
+    Start the bgutil HTTP server once and keep it alive across
+    Streamlit reruns. Returns the base URL. The child process
+    survives even though we don't hold the handle; the port guard
+    prevents duplicate starts on rerun.
+    """
+
+    if not _port_open(POT_HOST, POT_PORT):
+
+        subprocess.Popen(
+            [node_bin, build_main, "--port", str(POT_PORT)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Wait up to ~10s for the server to accept connections.
+        for _ in range(40):
+            if _port_open(POT_HOST, POT_PORT):
+                break
+            time.sleep(0.25)
+        else:
+            raise RuntimeError(
+                f"PO Token server did not come up on {POT_HOST}:{POT_PORT}"
+            )
+
+    return f"http://{POT_HOST}:{POT_PORT}"
+
+
+def setup_pot_provider(node_path: Path) -> tuple[bool, str | None]:
+    """
+    Best-effort: build + start the POT provider. On failure the app
+    still runs (client fallback + cookies only), just without GVS
+    tokens. Returns (ready, error_message).
+    """
+
+    try:
+        build_main = ensure_bgutil_built(str(node_path.parent))
+        start_pot_server(str(node_path), build_main)
+        return True, None
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or "").strip()[-500:]
+        return False, f"{e} :: {detail}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
+# ============================================================
 # OPTIONAL: COOKIES + PROXY (from Streamlit secrets)
 # ============================================================
 #
@@ -103,9 +226,12 @@ def setup_node():
 #   """
 #   YTDLP_PROXY = "http://user:pass@residential-proxy-host:port"
 #
-# Cookies help with "sign in to confirm you're not a bot" gating.
-# A proxy is the only real fix if YouTube is blocking this app's
-# IP outright (very common on shared cloud hosts).
+# Cookies clear the "sign in to confirm you're not a bot" gate.
+# A residential proxy is the only reliable fix when YouTube blocks
+# the host's IP outright — the usual situation on Streamlit Cloud's
+# shared datacenter IPs. Note that cookies exported from your home
+# browser can get invalidated quickly when replayed from a
+# datacenter IP, so treat the proxy as the durable fallback.
 
 def get_cookiefile() -> Path | None:
     cookies_text = st.secrets.get("YTDLP_COOKIES") if hasattr(st, "secrets") else None
@@ -171,9 +297,6 @@ def download_media(
         elif data.get("status") == "finished":
             progress_bar.progress(1.0)
             status_text.write("Processing file...")
-
-    def logger_debug(msg):
-        log_lines.append(msg)
 
     class _Logger:
         def debug(self, msg):
@@ -254,7 +377,7 @@ def download_with_fallbacks(url, media_format, progress_bar, status_text, log_li
             )
             return filepath, clients
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             last_error = e
             log_lines.append(f"Failed with clients {clients}: {e}")
             continue
@@ -318,6 +441,21 @@ if st.button(
 
             status_text.write(f"Using Node.js: `{node_path}`")
 
+            # Best-effort PO Token provider. If it fails to build or
+            # start, we carry on without GVS tokens.
+            pot_ready, pot_error = setup_pot_provider(node_path)
+
+            if pot_ready:
+                status_text.write("PO Token provider: **running** on port 4416")
+                log_lines.append("PO Token provider: running on 127.0.0.1:4416")
+            else:
+                st.warning(
+                    "PO Token provider could not start — continuing without GVS "
+                    "tokens. web/mweb clients may 403 on media; the `tv` fallback "
+                    "may still work at reduced quality. See the diagnostic log."
+                )
+                log_lines.append(f"PO Token provider FAILED: {pot_error}")
+
             with st.spinner(f"Downloading {format_choice}..."):
                 filepath, client_used = download_with_fallbacks(
                     clean_url, format_choice, progress_bar, status_text, log_lines
@@ -341,33 +479,35 @@ if st.button(
                     use_container_width=True,
                 )
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
 
             progress_bar.empty()
             status_text.empty()
 
             error_str = str(e)
 
-            # Give a targeted hint based on what actually failed
-            if "403" in error_str:
-                hint = (
-                    "All player clients returned 403. This usually means YouTube "
-                    "is blocking this server's IP address outright (common on "
-                    "shared cloud hosts). A residential/rotating proxy "
-                    "(`YTDLP_PROXY` secret) is the most reliable fix. Cookies "
-                    "alone will not resolve a pure IP block."
-                )
-            elif "Sign in to confirm" in error_str or "not a bot" in error_str:
+            # Give a targeted hint based on what actually failed.
+            if "Sign in to confirm" in error_str or "not a bot" in error_str:
                 hint = (
                     "YouTube is asking for bot verification. Add a fresh "
                     "`YTDLP_COOKIES` secret (exported from a logged-in browser "
-                    "session) and try again."
+                    "session) and try again. On a datacenter IP these cookies can "
+                    "expire fast — a residential `YTDLP_PROXY` is the durable fix."
                 )
             elif "PO Token" in error_str or "po_token" in error_str.lower():
                 hint = (
-                    "A PO Token is required for the clients that were tried. "
-                    "Check the yt-dlp PO Token provider plugin docs, or rely on "
-                    "the `tv`/`web_safari` clients which usually need it less."
+                    "A GVS PO Token was required but not supplied — the provider "
+                    "likely isn't running. Check the diagnostic log for the bgutil "
+                    "build/start error, and confirm `bgutil-ytdlp-pot-provider` is "
+                    "in requirements.txt (version matching BGUTIL_VERSION)."
+                )
+            elif "403" in error_str:
+                hint = (
+                    "Every client 403'd even with the PO Token provider up. This is "
+                    "the signature of a hard IP block on the media servers — common "
+                    "on Streamlit Cloud's shared GCP IPs. A residential/rotating "
+                    "proxy (`YTDLP_PROXY` secret) is the reliable fix here; cookies "
+                    "and PO tokens alone won't clear a pure IP block."
                 )
             else:
                 hint = None
